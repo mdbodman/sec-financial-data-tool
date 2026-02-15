@@ -1,18 +1,17 @@
 """
 SEC Financial Statement Data Extraction Tool
-Retrieves and parses XBRL financial data from SEC EDGAR filings
+Retrieves and parses financial data from SEC Financial Statement Data Sets
 """
 
 import streamlit as st
 import pandas as pd
 import requests
-from datetime import datetime, timedelta
-from io import BytesIO
+from datetime import datetime
+from io import BytesIO, StringIO
 import time
 from typing import List, Dict, Optional, Tuple
-import xml.etree.ElementTree as ET
-from bs4 import BeautifulSoup
-import re
+import zipfile
+from urllib.parse import urljoin
 
 # Page configuration
 st.set_page_config(
@@ -24,10 +23,10 @@ st.set_page_config(
 # Constants
 SEC_EDGAR_BASE = "https://www.sec.gov"
 SEC_API_BASE = "https://data.sec.gov"
+SEC_DATASETS_BASE = "https://www.sec.gov/files/dera/data/financial-statement-data-sets/"
 REQUEST_HEADERS = {
     'User-Agent': 'Financial Data Tool research@example.com',
     'Accept-Encoding': 'gzip, deflate',
-    'Host': 'data.sec.gov'
 }
 
 # Initialize session state
@@ -38,21 +37,19 @@ if 'financial_data' not in st.session_state:
 if 'ticker' not in st.session_state:
     st.session_state.ticker = ""
 
+@st.cache_data(ttl=3600)
 def get_cik_from_ticker(ticker: str) -> Optional[str]:
     """Convert ticker symbol to CIK number"""
     try:
         ticker = ticker.strip().upper()
-        # Get company tickers JSON from SEC
         url = f"{SEC_API_BASE}/files/company_tickers.json"
         response = requests.get(url, headers=REQUEST_HEADERS)
         response.raise_for_status()
         
         companies = response.json()
         
-        # Search for ticker
         for company in companies.values():
             if company['ticker'] == ticker:
-                # Pad CIK with leading zeros to 10 digits
                 cik = str(company['cik_str']).zfill(10)
                 return cik
         
@@ -61,115 +58,222 @@ def get_cik_from_ticker(ticker: str) -> Optional[str]:
         st.error(f"Error retrieving CIK: {str(e)}")
         return None
 
-def get_company_filings(cik: str, filing_type: str, years: int) -> List[Dict]:
-    """Retrieve filing metadata from SEC EDGAR"""
+def get_available_quarters() -> List[str]:
+    """Get list of available quarterly dataset periods"""
+    # Generate quarters from 2020 onwards
+    quarters = []
+    current_year = datetime.now().year
+    current_quarter = (datetime.now().month - 1) // 3 + 1
+    
+    for year in range(2020, current_year + 1):
+        for q in range(1, 5):
+            if year == current_year and q > current_quarter:
+                break
+            quarters.append(f"{year}q{q}")
+    
+    return sorted(quarters, reverse=True)
+
+@st.cache_data(ttl=3600)
+def download_dataset(quarter: str) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+    """Download and parse SEC Financial Statement Data Set for a given quarter"""
     try:
-        url = f"{SEC_API_BASE}/submissions/CIK{cik}.json"
-        response = requests.get(url, headers=REQUEST_HEADERS)
+        # Construct URL for the quarterly dataset
+        zip_filename = f"{quarter}.zip"
+        url = urljoin(SEC_DATASETS_BASE, zip_filename)
+        
+        # Download the ZIP file
+        response = requests.get(url, headers=REQUEST_HEADERS, timeout=120)
         response.raise_for_status()
-        time.sleep(0.1)  # Rate limiting
         
-        data = response.json()
-        filings = data.get('filings', {}).get('recent', {})
-        
-        # Filter by filing type and date
-        cutoff_date = datetime.now() - timedelta(days=years * 365)
-        
-        filtered_filings = []
-        for i in range(len(filings.get('form', []))):
-            form = filings['form'][i]
-            filing_date = datetime.strptime(filings['filingDate'][i], '%Y-%m-%d')
+        # Extract files from ZIP
+        with zipfile.ZipFile(BytesIO(response.content)) as z:
+            # Read the three main files
+            # SUB - submission data
+            # NUM - numeric data
+            # TAG - tag definitions
             
-            if form == filing_type and filing_date >= cutoff_date:
-                filtered_filings.append({
-                    'accessionNumber': filings['accessionNumber'][i],
-                    'filingDate': filings['filingDate'][i],
-                    'reportDate': filings['reportDate'][i],
-                    'form': form
-                })
+            with z.open('sub.txt') as f:
+                sub_df = pd.read_csv(f, sep='\t', dtype=str, low_memory=False)
+            
+            with z.open('num.txt') as f:
+                num_df = pd.read_csv(f, sep='\t', dtype=str, low_memory=False)
+            
+            with z.open('tag.txt') as f:
+                tag_df = pd.read_csv(f, sep='\t', dtype=str, low_memory=False)
         
-        return filtered_filings[:years * (4 if filing_type == '10-Q' else 1)]
+        return sub_df, num_df, tag_df
     
     except Exception as e:
-        st.error(f"Error retrieving filings: {str(e)}")
+        st.warning(f"Could not download dataset for {quarter}: {str(e)}")
+        return None, None, None
+
+def get_company_data(cik: str, num_df: pd.DataFrame, sub_df: pd.DataFrame, tag_df: pd.DataFrame, filing_type: str = '10-K') -> List[Dict]:
+    """Extract company filings from dataset"""
+    try:
+        # Filter submissions for this CIK and filing type
+        company_subs = sub_df[
+            (sub_df['cik'] == cik) & 
+            (sub_df['form'] == filing_type)
+        ].copy()
+        
+        if company_subs.empty:
+            return []
+        
+        # Get unique adsh (accession numbers)
+        filings = []
+        for _, row in company_subs.iterrows():
+            filings.append({
+                'adsh': row['adsh'],
+                'cik': row['cik'],
+                'name': row['name'],
+                'form': row['form'],
+                'filed': row['filed'],
+                'period': row['period'],
+                'fy': row['fy'],
+                'fp': row['fp']
+            })
+        
+        return filings
+    
+    except Exception as e:
+        st.error(f"Error extracting company data: {str(e)}")
         return []
 
-def parse_financial_statement_data(cik: str, accession: str) -> Dict[str, pd.DataFrame]:
-    """
-    Parse financial data from SEC filing using Financial Statement Data Sets
-    This uses the structured data tables that SEC provides
-    """
+def extract_financial_statements(adsh: str, num_df: pd.DataFrame, tag_df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    """Extract financial statement data for a specific filing"""
     try:
-        # Remove dashes from accession number for URL
-        accession_no_dash = accession.replace('-', '')
+        # Filter numeric data for this filing
+        filing_data = num_df[num_df['adsh'] == adsh].copy()
         
-        # Construct URL for the filing's index
-        base_url = f"{SEC_EDGAR_BASE}/cgi-bin/viewer?action=view&cik={cik}&accession_number={accession}&xbrl_type=v"
+        if filing_data.empty:
+            return {}
         
-        # For this simplified version, we'll use the Financial Statement Data Sets
-        # which provide pre-parsed XBRL data in a more accessible format
+        # Merge with tag descriptions
+        filing_data = filing_data.merge(
+            tag_df[['tag', 'tlabel', 'version']], 
+            on='tag', 
+            how='left'
+        )
         
-        # This is a placeholder structure - in production you would parse actual XBRL
-        # or use the SEC's Financial Statement Data Sets
-        return create_sample_data_structure()
+        # Filter for US GAAP tags only
+        filing_data = filing_data[filing_data['version'].str.contains('us-gaap', na=False)]
         
+        # Define key line items for each statement
+        balance_sheet_tags = [
+            'Assets', 'AssetsCurrent', 'AssetsNoncurrent',
+            'Liabilities', 'LiabilitiesCurrent', 'LiabilitiesNoncurrent',
+            'StockholdersEquity', 'LiabilitiesAndStockholdersEquity',
+            'CashAndCashEquivalentsAtCarryingValue',
+            'AccountsReceivableNetCurrent',
+            'InventoryNet',
+            'PropertyPlantAndEquipmentNet',
+            'AccountsPayableCurrent',
+            'LongTermDebtNoncurrent'
+        ]
+        
+        income_statement_tags = [
+            'Revenues', 'RevenueFromContractWithCustomerExcludingAssessedTax',
+            'CostOfRevenue', 'CostOfGoodsAndServicesSold',
+            'GrossProfit',
+            'OperatingExpenses', 'OperatingIncomeLoss',
+            'IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest',
+            'IncomeTaxExpenseBenefit',
+            'NetIncomeLoss', 'ProfitLoss',
+            'EarningsPerShareBasic', 'EarningsPerShareDiluted'
+        ]
+        
+        cash_flow_tags = [
+            'NetCashProvidedByUsedInOperatingActivities',
+            'NetCashProvidedByUsedInInvestingActivities',
+            'NetCashProvidedByUsedInFinancingActivities',
+            'CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalentsPeriodIncreaseDecreaseIncludingExchangeRateEffect',
+            'PaymentsToAcquirePropertyPlantAndEquipment',
+            'Depreciation', 'DepreciationDepletionAndAmortization'
+        ]
+        
+        # Extract each statement type
+        statements = {}
+        
+        # Balance Sheet
+        bs_data = filing_data[filing_data['tag'].isin(balance_sheet_tags)].copy()
+        if not bs_data.empty:
+            # Get most recent instant values
+            bs_data = bs_data[bs_data['ddate'].notna()]
+            bs_data = bs_data.sort_values('ddate', ascending=False)
+            bs_data = bs_data.drop_duplicates(subset=['tag'], keep='first')
+            statements['balance_sheet'] = bs_data[['tag', 'tlabel', 'value', 'ddate', 'uom']].copy()
+            statements['balance_sheet'].columns = ['Tag', 'Metric', 'Value', 'Date', 'Unit']
+        
+        # Income Statement
+        is_data = filing_data[filing_data['tag'].isin(income_statement_tags)].copy()
+        if not is_data.empty:
+            # Get duration values (typically qtrs=1 for quarterly, qtrs=4 for annual)
+            is_data = is_data[is_data['qtrs'].notna()]
+            is_data = is_data.sort_values(['tag', 'ddate'], ascending=[True, False])
+            is_data = is_data.drop_duplicates(subset=['tag'], keep='first')
+            statements['income_statement'] = is_data[['tag', 'tlabel', 'value', 'ddate', 'uom', 'qtrs']].copy()
+            statements['income_statement'].columns = ['Tag', 'Metric', 'Value', 'Date', 'Unit', 'Quarters']
+        
+        # Cash Flow Statement
+        cf_data = filing_data[filing_data['tag'].isin(cash_flow_tags)].copy()
+        if not cf_data.empty:
+            # Get duration values
+            cf_data = cf_data[cf_data['qtrs'].notna()]
+            cf_data = cf_data.sort_values(['tag', 'ddate'], ascending=[True, False])
+            cf_data = cf_data.drop_duplicates(subset=['tag'], keep='first')
+            statements['cash_flow'] = cf_data[['tag', 'tlabel', 'value', 'ddate', 'uom', 'qtrs']].copy()
+            statements['cash_flow'].columns = ['Tag', 'Metric', 'Value', 'Date', 'Unit', 'Quarters']
+        
+        return statements
+    
     except Exception as e:
-        st.warning(f"Could not parse filing {accession}: {str(e)}")
+        st.warning(f"Error extracting statements: {str(e)}")
         return {}
 
-def create_sample_data_structure() -> Dict[str, pd.DataFrame]:
-    """
-    Create sample data structure for demonstration
-    In production, this would parse actual XBRL files
-    """
-    return {
-        'balance_sheet': pd.DataFrame(),
-        'income_statement': pd.DataFrame(),
-        'cash_flow': pd.DataFrame()
-    }
-
-def aggregate_financial_data(filings_data: List[Tuple[str, Dict]]) -> Dict[str, pd.DataFrame]:
-    """Aggregate data from multiple filings into consolidated statements"""
-    
+def aggregate_multi_period_data(all_filings_data: List[Tuple[str, Dict]]) -> Dict[str, pd.DataFrame]:
+    """Combine data from multiple periods"""
     balance_sheets = []
     income_statements = []
     cash_flows = []
     
-    for filing_date, data in filings_data:
-        if 'balance_sheet' in data and not data['balance_sheet'].empty:
-            df = data['balance_sheet'].copy()
-            df['Period'] = filing_date
+    for period, statements in all_filings_data:
+        if 'balance_sheet' in statements and not statements['balance_sheet'].empty:
+            df = statements['balance_sheet'].copy()
+            df['Period'] = period
             balance_sheets.append(df)
         
-        if 'income_statement' in data and not data['income_statement'].empty:
-            df = data['income_statement'].copy()
-            df['Period'] = filing_date
+        if 'income_statement' in statements and not statements['income_statement'].empty:
+            df = statements['income_statement'].copy()
+            df['Period'] = period
             income_statements.append(df)
         
-        if 'cash_flow' in data and not data['cash_flow'].empty:
-            df = data['cash_flow'].copy()
-            df['Period'] = filing_date
+        if 'cash_flow' in statements and not statements['cash_flow'].empty:
+            df = statements['cash_flow'].copy()
+            df['Period'] = period
             cash_flows.append(df)
     
-    # Combine all periods
-    combined_data = {}
+    combined = {}
     
     if balance_sheets:
-        combined_data['balance_sheet'] = pd.concat(balance_sheets, ignore_index=True)
+        combined['balance_sheet'] = pd.concat(balance_sheets, ignore_index=True)
+        # Convert value to numeric
+        combined['balance_sheet']['Value'] = pd.to_numeric(combined['balance_sheet']['Value'], errors='coerce')
     else:
-        combined_data['balance_sheet'] = pd.DataFrame()
+        combined['balance_sheet'] = pd.DataFrame()
     
     if income_statements:
-        combined_data['income_statement'] = pd.concat(income_statements, ignore_index=True)
+        combined['income_statement'] = pd.concat(income_statements, ignore_index=True)
+        combined['income_statement']['Value'] = pd.to_numeric(combined['income_statement']['Value'], errors='coerce')
     else:
-        combined_data['income_statement'] = pd.DataFrame()
+        combined['income_statement'] = pd.DataFrame()
     
     if cash_flows:
-        combined_data['cash_flow'] = pd.concat(cash_flows, ignore_index=True)
+        combined['cash_flow'] = pd.concat(cash_flows, ignore_index=True)
+        combined['cash_flow']['Value'] = pd.to_numeric(combined['cash_flow']['Value'], errors='coerce')
     else:
-        combined_data['cash_flow'] = pd.DataFrame()
+        combined['cash_flow'] = pd.DataFrame()
     
-    return combined_data
+    return combined
 
 def create_excel_download(data: Dict[str, pd.DataFrame], ticker: str) -> BytesIO:
     """Create Excel file with multiple sheets in memory"""
@@ -197,7 +301,7 @@ def create_csv_download(df: pd.DataFrame) -> BytesIO:
 
 def main():
     st.title("📊 SEC Financial Statement Data Extractor")
-    st.markdown("Extract financial data from SEC EDGAR filings in XBRL format")
+    st.markdown("Extract financial data from SEC Financial Statement Data Sets")
     
     # Sidebar for inputs
     with st.sidebar:
@@ -219,7 +323,7 @@ def main():
         years = st.select_slider(
             "Historical Period",
             options=[1, 2, 3, 4, 5],
-            value=3,
+            value=2,
             help="Number of years of historical data to retrieve"
         )
         
@@ -273,7 +377,7 @@ def main():
         
         try:
             # Step 1: Get CIK
-            status_text.text("Step 1/4: Looking up company CIK...")
+            status_text.text("Step 1/5: Looking up company CIK...")
             progress_bar.progress(0.1)
             
             cik = get_cik_from_ticker(ticker)
@@ -281,73 +385,96 @@ def main():
                 st.error(f"Could not find CIK for ticker: {ticker}")
                 return
             
-            st.success(f"Found CIK: {cik}")
+            # Remove leading zeros for display
+            cik_display = str(int(cik))
+            st.success(f"Found company (CIK: {cik_display})")
             
-            # Step 2: Get filings
-            status_text.text("Step 2/4: Retrieving filing list...")
+            # Step 2: Determine which quarters to download
+            status_text.text("Step 2/5: Identifying required datasets...")
+            progress_bar.progress(0.2)
+            
+            available_quarters = get_available_quarters()
+            # Determine how many quarters to fetch
+            num_periods = years * (4 if data_frequency == "Quarterly" else 1)
+            quarters_to_fetch = available_quarters[:min(num_periods * 2, len(available_quarters))]  # Fetch extra to ensure coverage
+            
+            st.info(f"Will search {len(quarters_to_fetch)} quarterly datasets")
+            
+            # Step 3: Download datasets
+            status_text.text("Step 3/5: Downloading SEC datasets (this may take 1-2 minutes)...")
             progress_bar.progress(0.3)
             
             filing_type = "10-K" if data_frequency == "Annual" else "10-Q"
-            filings = get_company_filings(cik, filing_type, years)
+            all_filings = []
+            datasets_checked = 0
             
-            if not filings:
-                st.warning(f"No {filing_type} filings found for the specified period")
+            for quarter in quarters_to_fetch:
+                datasets_checked += 1
+                progress = 0.3 + (0.3 * datasets_checked / len(quarters_to_fetch))
+                progress_bar.progress(progress)
+                status_text.text(f"Step 3/5: Checking dataset {quarter}... ({datasets_checked}/{len(quarters_to_fetch)})")
+                
+                sub_df, num_df, tag_df = download_dataset(quarter)
+                
+                if sub_df is None or num_df is None or tag_df is None:
+                    continue
+                
+                # Look for company filings in this dataset
+                filings = get_company_data(cik, num_df, sub_df, tag_df, filing_type)
+                
+                for filing in filings:
+                    all_filings.append((filing, num_df, tag_df))
+                
+                # Stop if we have enough filings
+                if len(all_filings) >= num_periods:
+                    break
+                
+                time.sleep(0.2)  # Rate limiting
+            
+            if not all_filings:
+                st.error(f"No {filing_type} filings found in available datasets")
                 return
             
-            st.success(f"Found {len(filings)} {filing_type} filings")
+            # Limit to requested number of periods
+            all_filings = all_filings[:num_periods]
+            st.success(f"Found {len(all_filings)} {filing_type} filings")
             
-            # Step 3: Parse filings
-            status_text.text("Step 3/4: Parsing financial statements...")
-            progress_bar.progress(0.5)
+            # Step 4: Extract financial data
+            status_text.text("Step 4/5: Extracting financial statements...")
+            progress_bar.progress(0.7)
             
-            # Note: This is a simplified implementation
-            # Full XBRL parsing requires additional libraries and complexity
-            st.warning("""
-            **Note**: This is a demonstration version that shows the application structure.
-            Full XBRL parsing requires:
-            - SEC Financial Statement Data Sets (quarterly ZIP files)
-            - XBRL parsing libraries (python-xbrl, Arelle, or xbrlreader)
-            - Complex taxonomy mapping for GAAP elements
+            filings_data = []
+            for i, (filing, num_df, tag_df) in enumerate(all_filings):
+                progress = 0.7 + (0.2 * (i + 1) / len(all_filings))
+                progress_bar.progress(progress)
+                
+                statements = extract_financial_statements(filing['adsh'], num_df, tag_df)
+                if statements:
+                    filings_data.append((filing['period'], statements))
             
-            For production use, you would need to:
-            1. Download SEC Financial Statement Data Sets from: https://www.sec.gov/dera/data/financial-statement-data-sets.html
-            2. Parse the data using proper XBRL libraries
-            3. Map company-specific taxonomy extensions to standard GAAP elements
-            """)
+            if not filings_data:
+                st.error("Could not extract financial data from filings")
+                return
             
-            # Create sample structure to demonstrate download functionality
-            sample_data = {
-                'balance_sheet': pd.DataFrame({
-                    'Metric': ['Total Assets', 'Total Liabilities', 'Stockholders Equity'],
-                    'Period': ['2024-Q3', '2024-Q3', '2024-Q3'],
-                    'Value': [1000000, 600000, 400000],
-                    'Units': ['USD', 'USD', 'USD']
-                }),
-                'income_statement': pd.DataFrame({
-                    'Metric': ['Revenue', 'Operating Expenses', 'Net Income'],
-                    'Period': ['2024-Q3', '2024-Q3', '2024-Q3'],
-                    'Value': [500000, 300000, 200000],
-                    'Units': ['USD', 'USD', 'USD']
-                }),
-                'cash_flow': pd.DataFrame({
-                    'Metric': ['Operating Cash Flow', 'Investing Cash Flow', 'Financing Cash Flow'],
-                    'Period': ['2024-Q3', '2024-Q3', '2024-Q3'],
-                    'Value': [150000, -50000, -30000],
-                    'Units': ['USD', 'USD', 'USD']
-                })
-            }
+            # Step 5: Aggregate data
+            status_text.text("Step 5/5: Aggregating data across periods...")
+            progress_bar.progress(0.9)
             
-            st.session_state.financial_data = sample_data
+            combined_data = aggregate_multi_period_data(filings_data)
+            
+            st.session_state.financial_data = combined_data
             st.session_state.data_retrieved = True
             
-            # Step 4: Complete
-            status_text.text("Step 4/4: Processing complete!")
+            # Complete
+            status_text.text("Complete!")
             progress_bar.progress(1.0)
             
             st.success(f"✅ Retrieved financial data for {ticker}")
             
         except Exception as e:
             st.error(f"Error during data retrieval: {str(e)}")
+            import traceback
+            st.error(traceback.format_exc())
             return
     
     # Display results and download options
@@ -463,24 +590,39 @@ def main():
         2. **Select Frequency**: Choose Annual (10-K) or Quarterly (10-Q) filings
         3. **Choose Period**: Select how many years of historical data (1-5 years)
         4. **Select Format**: Choose Excel, CSV, or both
-        5. **Click Retrieve Data**: The app will fetch and parse SEC filings
+        5. **Click Retrieve Data**: The app will download SEC datasets and extract data
         6. **Review Data**: Preview the extracted financial statements
         7. **Download**: Click download buttons to save files to your device
         
+        ### Data Source:
+        
+        This tool uses **SEC Financial Statement Data Sets** - quarterly ZIP files published by the SEC containing pre-parsed XBRL data from all company filings.
+        
+        - Source: https://www.sec.gov/dera/data/financial-statement-data-sets.html
+        - Data from 2020 onwards
+        - Updated quarterly by the SEC
+        - Contains standardized US-GAAP taxonomy tags
+        
+        ### Processing Time:
+        
+        - Each quarterly dataset is 50-200 MB
+        - First download takes 1-2 minutes (cached for 1 hour)
+        - Subsequent queries for same period are faster
+        
         ### Important Notes:
         
-        - This demonstration version shows the application structure
-        - Full XBRL parsing requires additional implementation
-        - Data is retrieved from SEC EDGAR database
-        - Rate limited to comply with SEC guidelines (10 requests/second)
-        - Only works for U.S. public companies that file with the SEC
+        - Only works for U.S. public companies filing with the SEC
+        - Data availability depends on SEC dataset publication schedule
+        - Values are in the units reported by the company (typically USD)
+        - Some line items may not be present for all companies
+        - Data extracted uses US-GAAP standard taxonomy tags
         
         ### Limitations:
         
         - Company-specific accounting policies may vary
-        - Some line items may use non-standard taxonomy
+        - Not all line items available for all companies
         - Historical restatements may not be reflected
-        - Data availability depends on company filing history
+        - Data limited to periods covered by SEC datasets (2020+)
         """)
 
 if __name__ == "__main__":
