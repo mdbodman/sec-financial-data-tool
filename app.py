@@ -65,14 +65,30 @@ def get_cik_from_ticker(ticker: str) -> Optional[str]:
 
 def get_available_quarters() -> List[str]:
     """Get list of available quarterly dataset periods"""
-    # Generate quarters from 2020 onwards
+    # SEC publishes datasets with a delay of 6-10 weeks after quarter end
+    # Generate quarters from 2020 onwards, but exclude very recent quarters
     quarters = []
     current_year = datetime.now().year
-    current_quarter = (datetime.now().month - 1) // 3 + 1
+    current_month = datetime.now().month
+    
+    # Calculate which quarter we're in
+    current_quarter = (current_month - 1) // 3 + 1
+    
+    # SEC typically hasn't published the current quarter yet, and sometimes
+    # the previous quarter is still being finalized. Go back 2 quarters to be safe.
+    if current_quarter <= 2:
+        last_available_year = current_year - 1
+        last_available_quarter = 4 + (current_quarter - 2)
+    else:
+        last_available_year = current_year
+        last_available_quarter = current_quarter - 2
     
     for year in range(2020, current_year + 1):
         for q in range(1, 5):
-            if year == current_year and q > current_quarter:
+            # Don't include quarters that likely aren't published yet
+            if year > last_available_year:
+                break
+            if year == last_available_year and q > last_available_quarter:
                 break
             quarters.append(f"{year}q{q}")
     
