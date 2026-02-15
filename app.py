@@ -42,8 +42,13 @@ def get_cik_from_ticker(ticker: str) -> Optional[str]:
     """Convert ticker symbol to CIK number"""
     try:
         ticker = ticker.strip().upper()
-        url = f"{SEC_API_BASE}/files/company_tickers.json"
-        response = requests.get(url, headers=REQUEST_HEADERS)
+        # Use the correct SEC endpoint
+        url = "https://www.sec.gov/files/company_tickers.json"
+        headers = {
+            'User-Agent': 'Financial Data Tool research@example.com',
+            'Accept-Encoding': 'gzip, deflate',
+        }
+        response = requests.get(url, headers=headers)
         response.raise_for_status()
         
         companies = response.json()
